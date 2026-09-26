@@ -1,7 +1,7 @@
 """
-Radar Formaturas: diagnóstico.
-Descobre a estrutura das tabelas de educação na Base dos Dados (BigQuery)
-e manda um relatório em texto pelo Telegram. Não gera lista ainda.
+Radar Formaturas: diagnóstico 2.
+Confirma o diretório de escolas (nome, endereço, telefone), os códigos das séries
+e dos cursos, e manda um relatório em texto pelo Telegram.
 """
 import json
 import os
@@ -10,9 +10,8 @@ import requests
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-DATASETS = ["basedosdados.br_inep_censo_escolar", "basedosdados.br_inep_censo_educacao_superior"]
-MUNICIPIO = "basedosdados.br_bd_diretorios_brasil.municipio"
 LIMITE = 50 * 10**9
+VOTU = "3557105"
 linhas = []
 
 
@@ -28,63 +27,76 @@ bq = bigquery.Client(credentials=service_account.Credentials.from_service_accoun
 
 
 def consulta(sql):
-    cfg = bigquery.QueryJobConfig(maximum_bytes_billed=LIMITE)
-    return list(bq.query(sql, job_config=cfg).result())
+    return list(bq.query(sql, job_config=bigquery.QueryJobConfig(maximum_bytes_billed=LIMITE)).result())
 
 
-# 1. Diretório de municípios: colunas e microrregiões da área
-try:
-    cols = [c.name for c in bq.get_table(MUNICIPIO).schema]
-    out("== municipio:", ", ".join(cols))
-    col_micro = next((c for c in cols if "microrregiao" in c and "nome" in c), None)
-    if col_micro:
-        for r in consulta(f"SELECT {col_micro} AS m, COUNT(*) n, STRING_AGG(nome, ', ') cidades FROM `{MUNICIPIO}` "
-                          f"WHERE sigla_uf='SP' AND ({col_micro} LIKE '%Votuporanga%' OR {col_micro} LIKE '%Fernand%' "
-                          f"OR {col_micro} LIKE '%Jales%') GROUP BY 1"):
-            out(f"MICRO {r.m} ({r.n}): {r.cidades}")
-        for r in consulta(f"SELECT id_municipio, nome FROM `{MUNICIPIO}` WHERE sigla_uf='SP' AND nome='Votuporanga'"):
-            out("VOTUPORANGA id:", r.id_municipio)
-except Exception as e:
-    out("ERRO municipio:", e)
-
-# 2. Tabelas e colunas das bases de educação
-for ds in DATASETS:
+def bloco(titulo, fn):
     try:
-        tabelas = [t.table_id for t in bq.list_tables(ds)]
-        out(f"\n== {ds}: {', '.join(tabelas)}")
-        for t in tabelas:
-            try:
-                tb = bq.get_table(f"{ds}.{t}")
-                out(f"-- {t} ({tb.num_rows} linhas): " + ", ".join(f"{c.name}:{c.field_type}" for c in tb.schema))
-            except Exception as e:
-                out(f"-- {t}: ERRO {e}")
+        out(f"\n== {titulo}")
+        fn()
     except Exception as e:
-        out(f"ERRO {ds}:", e)
+        out("ERRO:", str(e)[:800])
 
-# 3. Anos disponíveis e amostras de Votuporanga (id 3557105)
-for ds, t in [("basedosdados.br_inep_censo_escolar", "turma"), ("basedosdados.br_inep_censo_escolar", "escola"),
-              ("basedosdados.br_inep_censo_educacao_superior", "curso"),
-              ("basedosdados.br_inep_censo_educacao_superior", "ies")]:
-    try:
-        cols = [c.name for c in bq.get_table(f"{ds}.{t}").schema]
-        if "ano" in cols:
-            anos = [r.ano for r in consulta(f"SELECT DISTINCT ano FROM `{ds}.{t}` ORDER BY ano DESC LIMIT 3")]
-            out(f"\nANOS {t}: {anos}")
-            filtro = f"ano = {anos[0]}"
-        else:
-            filtro = "TRUE"
-        if "id_municipio" in cols:
-            filtro += " AND id_municipio = '3557105'"
-        for r in consulta(f"SELECT * FROM `{ds}.{t}` WHERE {filtro} LIMIT 3"):
-            out(f"AMOSTRA {t}: " + json.dumps({k: str(v) for k, v in dict(r).items()}, ensure_ascii=False)[:1500])
-    except Exception as e:
-        out(f"ERRO amostra {t}:", e)
 
-# 4. Envia o relatório como arquivo
+def diretorios():
+    tabs = [t.table_id for t in bq.list_tables("basedosdados.br_bd_diretorios_brasil")]
+    out("tabelas:", ", ".join(tabs))
+    for t in tabs:
+        if "escola" in t:
+            tb = bq.get_table(f"basedosdados.br_bd_diretorios_brasil.{t}")
+            out(f"-- {t} ({tb.num_rows}): " + ", ".join(f"{c.name}:{c.field_type}" for c in tb.schema))
+            for r in consulta(f"SELECT * FROM `basedosdados.br_bd_diretorios_brasil.{t}` "
+                              f"WHERE CAST(id_municipio AS STRING) = '{VOTU}' LIMIT 4"):
+                out("AMOSTRA:", json.dumps({k: str(v) for k, v in dict(r).items()}, ensure_ascii=False)[:1200])
+
+
+def dic_escolar():
+    for r in consulta("SELECT id_tabela, nome_coluna, chave, valor FROM `basedosdados.br_inep_censo_escolar.dicionario` "
+                      "WHERE nome_coluna IN ('etapa_ensino','rede','tipo_situacao_funcionamento') ORDER BY 1,2,SAFE_CAST(chave AS INT64)"):
+        out(f"{r.id_tabela}.{r.nome_coluna} {r.chave} = {r.valor}")
+
+
+def dic_superior():
+    for r in consulta("SELECT id_tabela, nome_coluna, chave, valor FROM `basedosdados.br_inep_censo_educacao_superior.dicionario` "
+                      "ORDER BY 1,2,SAFE_CAST(chave AS INT64)"):
+        out(f"{r.id_tabela}.{r.nome_coluna} {r.chave} = {r.valor}")
+
+
+def turmas_votu():
+    for r in consulta(f"SELECT etapa_ensino, rede, COUNT(*) turmas, SUM(quantidade_matriculas) alunos, "
+                      f"COUNTIF(quantidade_matriculas <= 30) ate30 FROM `basedosdados.br_inep_censo_escolar.turma` "
+                      f"WHERE ano = 2024 AND id_municipio = '{VOTU}' GROUP BY 1,2 ORDER BY SAFE_CAST(etapa_ensino AS INT64), 2"):
+        out(f"etapa {r.etapa_ensino} | {r.rede} | {r.turmas} turmas | {r.alunos} alunos | {r.ate30} até 30")
+
+
+def escolas_votu():
+    for r in consulta(f"SELECT id_escola, rede, tipo_situacao_funcionamento, cnpj_escola_privada, cnpj_mantenedora "
+                      f"FROM `basedosdados.br_inep_censo_escolar.escola` WHERE ano = 2025 AND id_municipio = '{VOTU}' LIMIT 15"):
+        out(dict(r))
+
+
+def cursos_votu():
+    for r in consulta(f"SELECT c.id_ies, i.nome AS ies, c.nome_curso, c.tipo_modalidade_ensino, c.tipo_grau_academico, "
+                      f"c.tipo_nivel_academico, c.quantidade_matriculas, c.quantidade_concluintes, "
+                      f"c.quantidade_concluintes_diurno, c.quantidade_concluintes_noturno "
+                      f"FROM `basedosdados.br_inep_censo_educacao_superior.curso` c "
+                      f"LEFT JOIN `basedosdados.br_inep_censo_educacao_superior.ies` i ON i.id_ies = c.id_ies AND i.ano = c.ano "
+                      f"WHERE c.ano = 2024 AND c.id_municipio = '{VOTU}' AND c.quantidade_matriculas > 0 "
+                      f"ORDER BY c.tipo_modalidade_ensino, c.quantidade_concluintes DESC LIMIT 40"):
+        out(dict(r))
+
+
+bloco("diretórios", diretorios)
+bloco("dicionário censo escolar", dic_escolar)
+bloco("dicionário censo superior", dic_superior)
+bloco("turmas de Votuporanga 2024 por etapa", turmas_votu)
+bloco("escolas de Votuporanga 2025", escolas_votu)
+bloco("cursos de Votuporanga 2024", cursos_votu)
+
 with open("diagnostico.txt", "w", encoding="utf-8") as f:
     f.write("\n".join(linhas))
 token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
 with open("diagnostico.txt", "rb") as f:
     requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
-                  data={"chat_id": chat, "caption": "🎓 Radar Formaturas: diagnóstico. Mande este arquivo para o Claude."},
-                  files={"document": ("diagnostico-formaturas.txt", f, "text/plain")}, timeout=120)
+                  data={"chat_id": chat, "caption": "🎓 Radar Formaturas: diagnóstico 2. Mande este arquivo para o Claude."},
+                  files={"document": ("diagnostico2-formaturas.txt", f, "text/plain")}, timeout=120)
